@@ -491,6 +491,7 @@ csio_mb_iq_write(struct csio_hw *hw, struct csio_mb *mbp, void *priv,
 	uint32_t iq_start_stop = (iq_params->iq_start)	?
 					FW_IQ_CMD_IQSTART_F :
 					FW_IQ_CMD_IQSTOP_F;
+	int relaxed = !(hw->flags & CSIO_HWF_ROOT_NO_RELAXED_ORDERING);
 
 	/*
 	 * If this IQ write is cascaded with IQ alloc request, do not
@@ -537,6 +538,8 @@ csio_mb_iq_write(struct csio_hw *hw, struct csio_mb *mbp, void *priv,
 		cmdp->iqns_to_fl0congen |= htonl(
 			FW_IQ_CMD_FL0HOSTFCMODE_V(iq_params->fl0hostfcmode)|
 			FW_IQ_CMD_FL0CPRIO_V(iq_params->fl0cprio)	|
+			FW_IQ_CMD_FL0FETCHRO_V(relaxed)			|
+			FW_IQ_CMD_FL0DATARO_V(relaxed)			|
 			FW_IQ_CMD_FL0PADEN_V(iq_params->fl0paden)	|
 			FW_IQ_CMD_FL0PACKEN_V(iq_params->fl0packen));
 		cmdp->fl0dcaen_to_fl0cidxfthresh |= htons(
@@ -1213,7 +1216,7 @@ csio_mb_issue(struct csio_hw *hw, struct csio_mb *mbp)
 		/* Queue mbox cmd, if another mbox cmd is active */
 		if (mbp->mb_cbfn == NULL) {
 			rv = -EBUSY;
-			csio_dbg(hw, "Couldnt own Mailbox %x op:0x%x\n",
+			csio_dbg(hw, "Couldn't own Mailbox %x op:0x%x\n",
 				    hw->pfn, *((uint8_t *)mbp->mb));
 
 			goto error_out;
@@ -1241,14 +1244,14 @@ csio_mb_issue(struct csio_hw *hw, struct csio_mb *mbp)
 				rv = owner ? -EBUSY : -ETIMEDOUT;
 
 				csio_dbg(hw,
-					 "Couldnt own Mailbox %x op:0x%x "
+					 "Couldn't own Mailbox %x op:0x%x "
 					 "owner:%x\n",
 					 hw->pfn, *((uint8_t *)mbp->mb), owner);
 				goto error_out;
 			} else {
 				if (mbm->mcurrent == NULL) {
 					csio_err(hw,
-						 "Couldnt own Mailbox %x "
+						 "Couldn't own Mailbox %x "
 						 "op:0x%x owner:%x\n",
 						 hw->pfn, *((uint8_t *)mbp->mb),
 						 owner);

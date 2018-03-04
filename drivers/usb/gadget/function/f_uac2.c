@@ -524,6 +524,8 @@ afunc_bind(struct usb_configuration *cfg, struct usb_function *fn)
 		dev_err(dev, "%s:%d Error!\n", __func__, __LINE__);
 		return ret;
 	}
+	iad_desc.bFirstInterface = ret;
+
 	std_ac_if_desc.bInterfaceNumber = ret;
 	uac2->ac_intf = ret;
 	uac2->ac_alt = 0;
@@ -917,7 +919,7 @@ static struct configfs_attribute *f_uac2_attrs[] = {
 	NULL,
 };
 
-static struct config_item_type f_uac2_func_type = {
+static const struct config_item_type f_uac2_func_type = {
 	.ct_item_ops	= &f_uac2_item_ops,
 	.ct_attrs	= f_uac2_attrs,
 	.ct_owner	= THIS_MODULE,
