@@ -24,13 +24,13 @@ It can be used for debugging or analyzing latencies and
 performance issues that take place outside of user-space.
 
 Although ftrace is typically considered the function tracer, it
-is really a frame work of several assorted tracing utilities.
+is really a framework of several assorted tracing utilities.
 There's latency tracing to examine what occurs between interrupts
 disabled and enabled, as well as for preemption and from a time
 a task is woken to the task is actually scheduled in.
 
 One of the most common uses of ftrace is the event tracing.
-Through out the kernel is hundreds of static event points that
+Throughout the kernel is hundreds of static event points that
 can be enabled via the tracefs file system to see what is
 going on in certain parts of the kernel.
 
@@ -224,6 +224,8 @@ of ftrace. Here is a list of some of the key files:
 	has a side effect of enabling or disabling specific functions
 	to be traced. Echoing names of functions into this file
 	will limit the trace to only those functions.
+	This influences the tracers "function" and "function_graph"
+	and thus also function profiling (see "function_profile_enabled").
 
 	The functions listed in "available_filter_functions" are what
 	can be written into this file.
@@ -265,6 +267,8 @@ of ftrace. Here is a list of some of the key files:
 	Functions listed in this file will cause the function graph
 	tracer to only trace these functions and the functions that
 	they call. (See the section "dynamic ftrace" for more details).
+	Note, set_ftrace_filter and set_ftrace_notrace still affects
+	what functions are being traced.
 
   set_graph_notrace:
 
@@ -277,7 +281,8 @@ of ftrace. Here is a list of some of the key files:
 
 	This lists the functions that ftrace has processed and can trace.
 	These are the function names that you can pass to
-	"set_ftrace_filter" or "set_ftrace_notrace".
+	"set_ftrace_filter", "set_ftrace_notrace",
+	"set_graph_function", or "set_graph_notrace".
 	(See the section "dynamic ftrace" below for more details.)
 
   dyn_ftrace_total_info:
@@ -324,9 +329,9 @@ of ftrace. Here is a list of some of the key files:
 	track of the time spent in those functions. The histogram
 	content can be displayed in the files:
 
-	trace_stats/function<cpu> ( function0, function1, etc).
+	trace_stat/function<cpu> ( function0, function1, etc).
 
-  trace_stats:
+  trace_stat:
 
 	A directory that holds different tracing stats.
 
@@ -457,13 +462,21 @@ of ftrace. Here is a list of some of the key files:
 
 	mono_raw:
 		This is the raw monotonic clock (CLOCK_MONOTONIC_RAW)
-		which is montonic but is not subject to any rate adjustments
+		which is monotonic but is not subject to any rate adjustments
 		and ticks at the same rate as the hardware clocksource.
 
 	boot:
-		Same as mono. Used to be a separate clock which accounted
-		for the time spent in suspend while CLOCK_MONOTONIC did
-		not.
+		This is the boot clock (CLOCK_BOOTTIME) and is based on the
+		fast monotonic clock, but also accounts for time spent in
+		suspend. Since the clock access is designed for use in
+		tracing in the suspend path, some side effects are possible
+		if clock is accessed after the suspend time is accounted before
+		the fast mono clock is updated. In this case, the clock update
+		appears to happen slightly sooner than it normally would have.
+		Also on 32-bit systems, it's possible that the 64-bit boot offset
+		sees a partial update. These effects are rare and post
+		processing should be able to handle them. See comments in the
+		ktime_get_boot_fast_ns() function for more information.
 
 	To set a clock, simply echo the clock name into this file::
 
@@ -498,6 +511,11 @@ of ftrace. Here is a list of some of the key files:
 	start::
 
 		trace_fd = open("trace_marker", WR_ONLY);
+
+	Note: Writing into the trace_marker file can also initiate triggers
+	      that are written into /sys/kernel/tracing/events/ftrace/print/trigger
+	      See "Event triggers" in Documentation/trace/events.rst and an
+              example in Documentation/trace/histogram.rst (Section 3.)
 
   trace_marker_raw:
 
@@ -896,8 +914,8 @@ The above is mostly meaningful for kernel developers.
 	current trace and the next trace.
 
 	  - '$' - greater than 1 second
-	  - '@' - greater than 100 milisecond
-	  - '*' - greater than 10 milisecond
+	  - '@' - greater than 100 millisecond
+	  - '*' - greater than 10 millisecond
 	  - '#' - greater than 1000 microsecond
 	  - '!' - greater than 100 microsecond
 	  - '+' - greater than 10 microsecond
@@ -2523,7 +2541,7 @@ At compile time every C file object is run through the
 recordmcount program (located in the scripts directory). This
 program will parse the ELF headers in the C object to find all
 the locations in the .text section that call mcount. Starting
-with gcc verson 4.6, the -mfentry has been added for x86, which
+with gcc version 4.6, the -mfentry has been added for x86, which
 calls "__fentry__" instead of "mcount". Which is called before
 the creation of the stack frame.
 
@@ -2960,7 +2978,7 @@ The following commands are supported:
   When the function is hit, it will dump the contents of the ftrace
   ring buffer to the console. This is useful if you need to debug
   something, and want to dump the trace when a certain function
-  is hit. Perhaps its a function that is called before a tripple
+  is hit. Perhaps it's a function that is called before a triple
   fault happens and does not allow you to get a regular dump.
 
 - cpudump:
@@ -2968,6 +2986,9 @@ The following commands are supported:
   ring buffer for the current CPU to the console. Unlike the "dump"
   command, it only prints out the contents of the ring buffer for the
   CPU that executed the function that triggered the dump.
+
+- stacktrace:
+  When the function is hit, a stack trace is recorded.
 
 trace_pipe
 ----------

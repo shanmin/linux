@@ -740,10 +740,7 @@ static int do_dma_request(struct mport_dma_req *req,
 	tx->callback = dma_xfer_callback;
 	tx->callback_param = req;
 
-	req->dmach = chan;
-	req->sync = sync;
 	req->status = DMA_IN_PROGRESS;
-	init_completion(&req->req_comp);
 	kref_get(&req->refcount);
 
 	cookie = dmaengine_submit(tx);
@@ -831,13 +828,20 @@ rio_dma_transfer(struct file *filp, u32 transfer_mode,
 	if (!req)
 		return -ENOMEM;
 
-	kref_init(&req->refcount);
-
 	ret = get_dma_channel(priv);
 	if (ret) {
 		kfree(req);
 		return ret;
 	}
+	chan = priv->dmach;
+
+	kref_init(&req->refcount);
+	init_completion(&req->req_comp);
+	req->dir = dir;
+	req->filp = filp;
+	req->priv = priv;
+	req->dmach = chan;
+	req->sync = sync;
 
 	/*
 	 * If parameter loc_addr != NULL, we are transferring data from/to
@@ -925,11 +929,6 @@ rio_dma_transfer(struct file *filp, u32 transfer_mode,
 				xfer->offset, xfer->length);
 	}
 
-	req->dir = dir;
-	req->filp = filp;
-	req->priv = priv;
-	chan = priv->dmach;
-
 	nents = dma_map_sg(chan->device->dev,
 			   req->sgt.sgl, req->sgt.nents, dir);
 	if (nents == 0) {
@@ -976,7 +975,7 @@ static int rio_mport_transfer_ioctl(struct file *filp, void __user *arg)
 	     priv->md->properties.transfer_mode) == 0)
 		return -ENODEV;
 
-	transfer = vmalloc(transaction.count * sizeof(*transfer));
+	transfer = vmalloc(array_size(sizeof(*transfer), transaction.count));
 	if (!transfer)
 		return -ENOMEM;
 
@@ -1007,7 +1006,6 @@ out_free:
 static int rio_mport_wait_for_async_dma(struct file *filp, void __user *arg)
 {
 	struct mport_cdev_priv *priv;
-	struct mport_dev *md;
 	struct rio_async_tx_wait w_param;
 	struct mport_dma_req *req;
 	dma_cookie_t cookie;
@@ -1017,7 +1015,6 @@ static int rio_mport_wait_for_async_dma(struct file *filp, void __user *arg)
 	int ret;
 
 	priv = (struct mport_cdev_priv *)filp->private_data;
-	md = priv->md;
 
 	if (unlikely(copy_from_user(&w_param, arg, sizeof(w_param))))
 		return -EFAULT;

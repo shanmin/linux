@@ -3999,29 +3999,6 @@ static void efx_ef10_prepare_flr(struct efx_nic *efx)
 	atomic_set(&efx->active_queues, 0);
 }
 
-static bool efx_ef10_filter_equal(const struct efx_filter_spec *left,
-				  const struct efx_filter_spec *right)
-{
-	if ((left->match_flags ^ right->match_flags) |
-	    ((left->flags ^ right->flags) &
-	     (EFX_FILTER_FLAG_RX | EFX_FILTER_FLAG_TX)))
-		return false;
-
-	return memcmp(&left->outer_vid, &right->outer_vid,
-		      sizeof(struct efx_filter_spec) -
-		      offsetof(struct efx_filter_spec, outer_vid)) == 0;
-}
-
-static unsigned int efx_ef10_filter_hash(const struct efx_filter_spec *spec)
-{
-	BUILD_BUG_ON(offsetof(struct efx_filter_spec, outer_vid) & 3);
-	return jhash2((const u32 *)&spec->outer_vid,
-		      (sizeof(struct efx_filter_spec) -
-		       offsetof(struct efx_filter_spec, outer_vid)) / 4,
-		      0);
-	/* XXX should we randomise the initval? */
-}
-
 /* Decide whether a filter should be exclusive or else should allow
  * delivery to additional recipients.  Currently we decide that
  * filters for specific local unicast MAC and IP addresses are
@@ -4311,9 +4288,9 @@ static int efx_ef10_filter_pri(struct efx_ef10_filter_table *table,
 	return -EPROTONOSUPPORT;
 }
 
-static s32 efx_ef10_filter_insert(struct efx_nic *efx,
-				  struct efx_filter_spec *spec,
-				  bool replace_equal)
+static s32 efx_ef10_filter_insert_locked(struct efx_nic *efx,
+					 struct efx_filter_spec *spec,
+					 bool replace_equal)
 {
 	DECLARE_BITMAP(mc_rem_map, EFX_EF10_FILTER_SEARCH_LIMIT);
 	struct efx_ef10_nic_data *nic_data = efx->nic_data;
@@ -4330,7 +4307,7 @@ static s32 efx_ef10_filter_insert(struct efx_nic *efx,
 	bool is_mc_recip;
 	s32 rc;
 
-	down_read(&efx->filter_sem);
+	WARN_ON(!rwsem_is_locked(&efx->filter_sem));
 	table = efx->filter_state;
 	down_write(&table->lock);
 
@@ -4346,7 +4323,7 @@ static s32 efx_ef10_filter_insert(struct efx_nic *efx,
 		goto out_unlock;
 	match_pri = rc;
 
-	hash = efx_ef10_filter_hash(spec);
+	hash = efx_filter_spec_hash(spec);
 	is_mc_recip = efx_filter_is_mc_recipient(spec);
 	if (is_mc_recip)
 		bitmap_zero(mc_rem_map, EFX_EF10_FILTER_SEARCH_LIMIT);
@@ -4378,7 +4355,7 @@ static s32 efx_ef10_filter_insert(struct efx_nic *efx,
 		if (!saved_spec) {
 			if (ins_index < 0)
 				ins_index = i;
-		} else if (efx_ef10_filter_equal(spec, saved_spec)) {
+		} else if (efx_filter_spec_equal(spec, saved_spec)) {
 			if (spec->priority < saved_spec->priority &&
 			    spec->priority != EFX_FILTER_PRI_AUTO) {
 				rc = -EPERM;
@@ -4521,8 +4498,20 @@ out_unlock:
 	if (rss_locked)
 		mutex_unlock(&efx->rss_lock);
 	up_write(&table->lock);
-	up_read(&efx->filter_sem);
 	return rc;
+}
+
+static s32 efx_ef10_filter_insert(struct efx_nic *efx,
+				  struct efx_filter_spec *spec,
+				  bool replace_equal)
+{
+	s32 ret;
+
+	down_read(&efx->filter_sem);
+	ret = efx_ef10_filter_insert_locked(efx, spec, replace_equal);
+	up_read(&efx->filter_sem);
+
+	return ret;
 }
 
 static void efx_ef10_filter_update_rx_scatter(struct efx_nic *efx)
@@ -4762,27 +4751,63 @@ static s32 efx_ef10_filter_get_rx_ids(struct efx_nic *efx,
 static bool efx_ef10_filter_rfs_expire_one(struct efx_nic *efx, u32 flow_id,
 					   unsigned int filter_idx)
 {
+	struct efx_filter_spec *spec, saved_spec;
 	struct efx_ef10_filter_table *table;
-	struct efx_filter_spec *spec;
-	bool ret;
+	struct efx_arfs_rule *rule = NULL;
+	bool ret = true, force = false;
+	u16 arfs_id;
 
 	down_read(&efx->filter_sem);
 	table = efx->filter_state;
 	down_write(&table->lock);
 	spec = efx_ef10_filter_entry_spec(table, filter_idx);
 
-	if (!spec || spec->priority != EFX_FILTER_PRI_HINT) {
-		ret = true;
+	if (!spec || spec->priority != EFX_FILTER_PRI_HINT)
 		goto out_unlock;
-	}
 
-	if (!rps_may_expire_flow(efx->net_dev, spec->dmaq_id, flow_id, 0)) {
+	spin_lock_bh(&efx->rps_hash_lock);
+	if (!efx->rps_hash_table) {
+		/* In the absence of the table, we always return 0 to ARFS. */
+		arfs_id = 0;
+	} else {
+		rule = efx_rps_hash_find(efx, spec);
+		if (!rule)
+			/* ARFS table doesn't know of this filter, so remove it */
+			goto expire;
+		arfs_id = rule->arfs_id;
+		ret = efx_rps_check_rule(rule, filter_idx, &force);
+		if (force)
+			goto expire;
+		if (!ret) {
+			spin_unlock_bh(&efx->rps_hash_lock);
+			goto out_unlock;
+		}
+	}
+	if (!rps_may_expire_flow(efx->net_dev, spec->dmaq_id, flow_id, arfs_id))
 		ret = false;
-		goto out_unlock;
+	else if (rule)
+		rule->filter_id = EFX_ARFS_FILTER_ID_REMOVING;
+expire:
+	saved_spec = *spec; /* remove operation will kfree spec */
+	spin_unlock_bh(&efx->rps_hash_lock);
+	/* At this point (since we dropped the lock), another thread might queue
+	 * up a fresh insertion request (but the actual insertion will be held
+	 * up by our possession of the filter table lock).  In that case, it
+	 * will set rule->filter_id to EFX_ARFS_FILTER_ID_PENDING, meaning that
+	 * the rule is not removed by efx_rps_hash_del() below.
+	 */
+	if (ret)
+		ret = efx_ef10_filter_remove_internal(efx, 1U << spec->priority,
+						      filter_idx, true) == 0;
+	/* While we can't safely dereference rule (we dropped the lock), we can
+	 * still test it for NULL.
+	 */
+	if (ret && rule) {
+		/* Expiring, so remove entry from ARFS table */
+		spin_lock_bh(&efx->rps_hash_lock);
+		efx_rps_hash_del(efx, &saved_spec);
+		spin_unlock_bh(&efx->rps_hash_lock);
 	}
-
-	ret = efx_ef10_filter_remove_internal(efx, 1U << spec->priority,
-					      filter_idx, true) == 0;
 out_unlock:
 	up_write(&table->lock);
 	up_read(&efx->filter_sem);
@@ -4971,7 +4996,8 @@ static int efx_ef10_filter_table_probe(struct efx_nic *efx)
 		net_dev->hw_features &= ~NETIF_F_HW_VLAN_CTAG_FILTER;
 	}
 
-	table->entry = vzalloc(HUNT_FILTER_TBL_ROWS * sizeof(*table->entry));
+	table->entry = vzalloc(array_size(HUNT_FILTER_TBL_ROWS,
+					  sizeof(*table->entry)));
 	if (!table->entry) {
 		rc = -ENOMEM;
 		goto fail;
@@ -5271,7 +5297,7 @@ static int efx_ef10_filter_insert_addr_list(struct efx_nic *efx,
 		EFX_WARN_ON_PARANOID(ids[i] != EFX_EF10_FILTER_ID_INVALID);
 		efx_filter_init_rx(&spec, EFX_FILTER_PRI_AUTO, filter_flags, 0);
 		efx_filter_set_eth_local(&spec, vlan->vid, addr_list[i].addr);
-		rc = efx_ef10_filter_insert(efx, &spec, true);
+		rc = efx_ef10_filter_insert_locked(efx, &spec, true);
 		if (rc < 0) {
 			if (rollback) {
 				netif_info(efx, drv, efx->net_dev,
@@ -5300,7 +5326,7 @@ static int efx_ef10_filter_insert_addr_list(struct efx_nic *efx,
 		efx_filter_init_rx(&spec, EFX_FILTER_PRI_AUTO, filter_flags, 0);
 		eth_broadcast_addr(baddr);
 		efx_filter_set_eth_local(&spec, vlan->vid, baddr);
-		rc = efx_ef10_filter_insert(efx, &spec, true);
+		rc = efx_ef10_filter_insert_locked(efx, &spec, true);
 		if (rc < 0) {
 			netif_warn(efx, drv, efx->net_dev,
 				   "Broadcast filter insert failed rc=%d\n", rc);
@@ -5356,7 +5382,7 @@ static int efx_ef10_filter_insert_def(struct efx_nic *efx,
 	if (vlan->vid != EFX_FILTER_VID_UNSPEC)
 		efx_filter_set_eth_local(&spec, vlan->vid, NULL);
 
-	rc = efx_ef10_filter_insert(efx, &spec, true);
+	rc = efx_ef10_filter_insert_locked(efx, &spec, true);
 	if (rc < 0) {
 		const char *um = multicast ? "Multicast" : "Unicast";
 		const char *encap_name = "";
@@ -5416,7 +5442,7 @@ static int efx_ef10_filter_insert_def(struct efx_nic *efx,
 					   filter_flags, 0);
 			eth_broadcast_addr(baddr);
 			efx_filter_set_eth_local(&spec, vlan->vid, baddr);
-			rc = efx_ef10_filter_insert(efx, &spec, true);
+			rc = efx_ef10_filter_insert_locked(efx, &spec, true);
 			if (rc < 0) {
 				netif_warn(efx, drv, efx->net_dev,
 					   "Broadcast filter insert failed rc=%d\n",
@@ -6015,6 +6041,10 @@ static const struct efx_ef10_nvram_type_info efx_ef10_nvram_types[] = {
 	{ NVRAM_PARTITION_TYPE_EXPROM_CONFIG_PORT3, 0,   3, "sfc_exp_rom_cfg" },
 	{ NVRAM_PARTITION_TYPE_LICENSE,		   0,    0, "sfc_license" },
 	{ NVRAM_PARTITION_TYPE_PHY_MIN,		   0xff, 0, "sfc_phy_fw" },
+	/* MUM and SUC firmware share the same partition type */
+	{ NVRAM_PARTITION_TYPE_MUM_FIRMWARE,	   0,    0, "sfc_mumfw" },
+	{ NVRAM_PARTITION_TYPE_EXPANSION_UEFI,	   0,    0, "sfc_uefi" },
+	{ NVRAM_PARTITION_TYPE_STATUS,		   0,    0, "sfc_status" }
 };
 
 static int efx_ef10_mtd_probe_partition(struct efx_nic *efx,
@@ -6065,6 +6095,9 @@ static int efx_ef10_mtd_probe_partition(struct efx_nic *efx,
 	part->common.mtd.flags = MTD_CAP_NORFLASH;
 	part->common.mtd.size = size;
 	part->common.mtd.erasesize = erase_size;
+	/* sfc_status is read-only */
+	if (!erase_size)
+		part->common.mtd.flags |= MTD_NO_ERASE;
 
 	return 0;
 }

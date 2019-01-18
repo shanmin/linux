@@ -1,3 +1,5 @@
+.. _magicnumbers:
+
 Linux magic numbers
 ===================
 
@@ -156,9 +158,6 @@ Note that there are also defined special per-driver magic numbers in sound
 memory management. See ``include/sound/sndmagic.h`` for complete list of them. Many
 OSS sound drivers have their magic numbers constructed from the soundcard PCI
 ID - these are not listed here as well.
-
-IrDA subsystem also uses large number of own magic numbers, see
-``include/net/irda/irda.h`` for a complete list of them.
 
 HFS is another larger user of magic numbers - you can find them in
 ``fs/hfs/hfs.h``.

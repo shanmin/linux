@@ -1,15 +1,11 @@
+// SPDX-License-Identifier: GPL-2.0
 /*
- * linux/kernel/time/tick-common.c
- *
  * This file contains the base functions to manage periodic tick
  * related events.
  *
  * Copyright(C) 2005-2006, Thomas Gleixner <tglx@linutronix.de>
  * Copyright(C) 2005-2007, Red Hat, Inc., Ingo Molnar
  * Copyright(C) 2006-2007, Timesys Corp., Thomas Gleixner
- *
- * This code is licenced under the GPL version 2. For details see
- * kernel-base/COPYING.
  */
 #include <linux/cpu.h>
 #include <linux/err.h>
@@ -419,19 +415,6 @@ void tick_suspend_local(void)
 	clockevents_shutdown(td->evtdev);
 }
 
-static void tick_forward_next_period(void)
-{
-	ktime_t delta, now = ktime_get();
-	u64 n;
-
-	delta = ktime_sub(now, tick_next_period);
-	n = ktime_divns(delta, tick_period);
-	tick_next_period += n * tick_period;
-	if (tick_next_period < now)
-		tick_next_period += tick_period;
-	tick_sched_forward_next_period();
-}
-
 /**
  * tick_resume_local - Resume the local tick device
  *
@@ -443,8 +426,6 @@ void tick_resume_local(void)
 {
 	struct tick_device *td = this_cpu_ptr(&tick_cpu_device);
 	bool broadcast = tick_resume_check_broadcast();
-
-	tick_forward_next_period();
 
 	clockevents_tick_resume(td->evtdev);
 	if (!broadcast) {
@@ -505,6 +486,7 @@ void tick_freeze(void)
 	if (tick_freeze_depth == num_online_cpus()) {
 		trace_suspend_resume(TPS("timekeeping_freeze"),
 				     smp_processor_id(), true);
+		system_state = SYSTEM_SUSPEND;
 		timekeeping_suspend();
 	} else {
 		tick_suspend_local();
@@ -528,6 +510,7 @@ void tick_unfreeze(void)
 
 	if (tick_freeze_depth == num_online_cpus()) {
 		timekeeping_resume();
+		system_state = SYSTEM_RUNNING;
 		trace_suspend_resume(TPS("timekeeping_freeze"),
 				     smp_processor_id(), false);
 	} else {

@@ -79,34 +79,6 @@ static void dsi_phy_hw_v3_0_lane_settings(struct msm_dsi_phy *phy)
 	dsi_phy_write(lane_base + REG_DSI_10nm_PHY_LN_TX_DCTRL(3), 0x04);
 }
 
-static int msm_dsi_dphy_timing_calc_v3(struct msm_dsi_dphy_timing *timing,
-				       struct msm_dsi_phy_clk_request *clk_req)
-{
-	/*
-	 * TODO: These params need to be computed, they're currently hardcoded
-	 * for a 1440x2560@60Hz panel with a byteclk of 100.618 Mhz, and a
-	 * default escape clock of 19.2 Mhz.
-	 */
-
-	timing->hs_halfbyte_en = 0;
-	timing->clk_zero = 0x1c;
-	timing->clk_prepare = 0x07;
-	timing->clk_trail = 0x07;
-	timing->hs_exit = 0x23;
-	timing->hs_zero = 0x21;
-	timing->hs_prepare = 0x07;
-	timing->hs_trail = 0x07;
-	timing->hs_rqst = 0x05;
-	timing->ta_sure = 0x00;
-	timing->ta_go = 0x03;
-	timing->ta_get = 0x04;
-
-	timing->shared_timings.clk_pre = 0x2d;
-	timing->shared_timings.clk_post = 0x0d;
-
-	return 0;
-}
-
 static int dsi_10nm_phy_enable(struct msm_dsi_phy *phy, int src_pll_id,
 			       struct msm_dsi_phy_clk_request *clk_req)
 {
@@ -121,7 +93,7 @@ static int dsi_10nm_phy_enable(struct msm_dsi_phy *phy, int src_pll_id,
 	DBG("");
 
 	if (msm_dsi_dphy_timing_calc_v3(timing, clk_req)) {
-		dev_err(&phy->pdev->dev,
+		DRM_DEV_ERROR(&phy->pdev->dev,
 			"%s: D-PHY timing calculation failed\n", __func__);
 		return -EINVAL;
 	}
@@ -200,7 +172,7 @@ static int dsi_10nm_phy_enable(struct msm_dsi_phy *phy, int src_pll_id,
 
 	ret = msm_dsi_pll_set_usecase(phy->pll, phy->usecase);
 	if (ret) {
-		dev_err(&phy->pdev->dev, "%s: set pll usecase failed, %d\n",
+		DRM_DEV_ERROR(&phy->pdev->dev, "%s: set pll usecase failed, %d\n",
 			__func__, ret);
 		return ret;
 	}
@@ -224,7 +196,7 @@ static int dsi_10nm_phy_init(struct msm_dsi_phy *phy)
 	phy->lane_base = msm_ioremap(pdev, "dsi_phy_lane",
 				     "DSI_PHY_LANE");
 	if (IS_ERR(phy->lane_base)) {
-		dev_err(&pdev->dev, "%s: failed to map phy lane base\n",
+		DRM_DEV_ERROR(&pdev->dev, "%s: failed to map phy lane base\n",
 			__func__);
 		return -ENOMEM;
 	}
