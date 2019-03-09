@@ -1822,6 +1822,9 @@ static void nvme_tcp_error_recovery_work(struct work_struct *work)
 
 static void nvme_tcp_teardown_ctrl(struct nvme_ctrl *ctrl, bool shutdown)
 {
+	cancel_work_sync(&to_tcp_ctrl(ctrl)->err_work);
+	cancel_delayed_work_sync(&to_tcp_ctrl(ctrl)->connect_work);
+
 	nvme_tcp_teardown_io_queues(ctrl, shutdown);
 	if (shutdown)
 		nvme_shutdown_ctrl(ctrl);
@@ -1857,12 +1860,6 @@ static void nvme_reset_ctrl_work(struct work_struct *work)
 out_fail:
 	++ctrl->nr_reconnects;
 	nvme_tcp_reconnect_or_remove(ctrl);
-}
-
-static void nvme_tcp_stop_ctrl(struct nvme_ctrl *ctrl)
-{
-	cancel_work_sync(&to_tcp_ctrl(ctrl)->err_work);
-	cancel_delayed_work_sync(&to_tcp_ctrl(ctrl)->connect_work);
 }
 
 static void nvme_tcp_free_ctrl(struct nvme_ctrl *nctrl)
@@ -1948,20 +1945,23 @@ nvme_tcp_timeout(struct request *rq, bool reserved)
 	struct nvme_tcp_ctrl *ctrl = req->queue->ctrl;
 	struct nvme_tcp_cmd_pdu *pdu = req->pdu;
 
-	dev_dbg(ctrl->ctrl.device,
+	dev_warn(ctrl->ctrl.device,
 		"queue %d: timeout request %#x type %d\n",
-		nvme_tcp_queue_id(req->queue), rq->tag,
-		pdu->hdr.type);
+		nvme_tcp_queue_id(req->queue), rq->tag, pdu->hdr.type);
 
 	if (ctrl->ctrl.state != NVME_CTRL_LIVE) {
-		union nvme_result res = {};
-
-		nvme_req(rq)->flags |= NVME_REQ_CANCELLED;
-		nvme_end_request(rq, cpu_to_le16(NVME_SC_ABORT_REQ), res);
+		/*
+		 * Teardown immediately if controller times out while starting
+		 * or we are already started error recovery. all outstanding
+		 * requests are completed on shutdown, so we return BLK_EH_DONE.
+		 */
+		flush_work(&ctrl->err_work);
+		nvme_tcp_teardown_io_queues(&ctrl->ctrl, false);
+		nvme_tcp_teardown_admin_queue(&ctrl->ctrl, false);
 		return BLK_EH_DONE;
 	}
 
-	/* queue error recovery */
+	dev_warn(ctrl->ctrl.device, "starting error recovery\n");
 	nvme_tcp_error_recovery(&ctrl->ctrl);
 
 	return BLK_EH_RESET_TIMER;
@@ -2112,7 +2112,6 @@ static const struct nvme_ctrl_ops nvme_tcp_ctrl_ops = {
 	.submit_async_event	= nvme_tcp_submit_async_event,
 	.delete_ctrl		= nvme_tcp_delete_ctrl,
 	.get_address		= nvmf_get_address,
-	.stop_ctrl		= nvme_tcp_stop_ctrl,
 };
 
 static bool
