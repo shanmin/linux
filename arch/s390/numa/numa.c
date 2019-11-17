@@ -92,8 +92,12 @@ static void __init numa_setup_memory(void)
 	} while (cur_base < end_of_dram);
 
 	/* Allocate and fill out node_data */
-	for (nid = 0; nid < MAX_NUMNODES; nid++)
+	for (nid = 0; nid < MAX_NUMNODES; nid++) {
 		NODE_DATA(nid) = memblock_alloc(sizeof(pg_data_t), 8);
+		if (!NODE_DATA(nid))
+			panic("%s: Failed to allocate %zu bytes align=0x%x\n",
+			      __func__, sizeof(pg_data_t), 8);
+	}
 
 	for_each_online_node(nid) {
 		unsigned long start_pfn, end_pfn;
@@ -154,6 +158,8 @@ early_param("numa_debug", parse_debug);
 
 static int __init parse_numa(char *parm)
 {
+	if (!parm)
+		return 1;
 	if (strcmp(parm, numa_mode_plain.name) == 0)
 		mode = &numa_mode_plain;
 #ifdef CONFIG_NUMA_EMU

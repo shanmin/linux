@@ -58,12 +58,13 @@
 #define SE_SBINITIALIZED	0x0100
 #define SE_SBPROC		0x0200
 #define SE_SBGENFS		0x0400
+#define SE_SBGENFS_XATTR	0x0800
 
-#define CONTEXT_STR	"context="
-#define FSCONTEXT_STR	"fscontext="
-#define ROOTCONTEXT_STR	"rootcontext="
-#define DEFCONTEXT_STR	"defcontext="
-#define LABELSUPP_STR "seclabel"
+#define CONTEXT_STR	"context"
+#define FSCONTEXT_STR	"fscontext"
+#define ROOTCONTEXT_STR	"rootcontext"
+#define DEFCONTEXT_STR	"defcontext"
+#define SECLABEL_STR "seclabel"
 
 struct netlbl_lsm_secattr;
 

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  *  NSA Security-Enhanced Linux (SELinux) security module
  *
@@ -18,10 +19,6 @@
  *  Copyright (C) 2007 Hitachi Software Engineering Co., Ltd.
  *		       Yuichi Nakamura <ynakam@hitachisoft.jp>
  *  Copyright (C) 2016 Mellanox Technologies
- *
- *	This program is free software; you can redistribute it and/or modify
- *	it under the terms of the GNU General Public License version 2,
- *	as published by the Free Software Foundation.
  */
 
 #include <linux/init.h>
@@ -48,6 +45,8 @@
 #include <linux/fdtable.h>
 #include <linux/namei.h>
 #include <linux/mount.h>
+#include <linux/fs_context.h>
+#include <linux/fs_parser.h>
 #include <linux/netfilter_ipv4.h>
 #include <linux/netfilter_ipv6.h>
 #include <linux/tty.h>
@@ -87,7 +86,11 @@
 #include <linux/msg.h>
 #include <linux/shm.h>
 #include <linux/bpf.h>
+#include <linux/kernfs.h>
+#include <linux/stringhash.h>	/* for hashlen_string() */
 #include <uapi/linux/mount.h>
+#include <linux/fsnotify.h>
+#include <linux/fanotify.h>
 
 #include "avc.h"
 #include "objsec.h"
@@ -193,7 +196,7 @@ static int selinux_lsm_notifier_avc_callback(u32 event)
 {
 	if (event == AVC_CALLBACK_RESET) {
 		sel_ib_pkey_flush();
-		call_lsm_notifier(LSM_POLICY_CHANGE, NULL);
+		call_blocking_lsm_notifier(LSM_POLICY_CHANGE, NULL);
 	}
 
 	return 0;
@@ -410,11 +413,11 @@ static inline int inode_doinit(struct inode *inode)
 
 enum {
 	Opt_error = -1,
-	Opt_context = 1,
+	Opt_context = 0,
+	Opt_defcontext = 1,
 	Opt_fscontext = 2,
-	Opt_defcontext = 3,
-	Opt_rootcontext = 4,
-	Opt_seclabel = 5,
+	Opt_rootcontext = 3,
+	Opt_seclabel = 4,
 };
 
 #define A(s, has_arg) {#s, sizeof(#s) - 1, Opt_##s, has_arg}
@@ -749,11 +752,13 @@ static int selinux_set_mnt_opts(struct super_block *sb,
 
 	if (!strcmp(sb->s_type->name, "debugfs") ||
 	    !strcmp(sb->s_type->name, "tracefs") ||
-	    !strcmp(sb->s_type->name, "sysfs") ||
-	    !strcmp(sb->s_type->name, "pstore") ||
+	    !strcmp(sb->s_type->name, "pstore"))
+		sbsec->flags |= SE_SBGENFS;
+
+	if (!strcmp(sb->s_type->name, "sysfs") ||
 	    !strcmp(sb->s_type->name, "cgroup") ||
 	    !strcmp(sb->s_type->name, "cgroup2"))
-		sbsec->flags |= SE_SBGENFS;
+		sbsec->flags |= SE_SBGENFS | SE_SBGENFS_XATTR;
 
 	if (!sbsec->behavior) {
 		/*
@@ -937,8 +942,11 @@ static int selinux_sb_clone_mnt_opts(const struct super_block *oldsb,
 	BUG_ON(!(oldsbsec->flags & SE_SBINITIALIZED));
 
 	/* if fs is reusing a sb, make sure that the contexts match */
-	if (newsbsec->flags & SE_SBINITIALIZED)
+	if (newsbsec->flags & SE_SBINITIALIZED) {
+		if ((kern_flags & SECURITY_LSM_NATIVE_LABELS) && !set_context)
+			*set_kern_flags |= SECURITY_LSM_NATIVE_LABELS;
 		return selinux_cmp_sb_context(oldsb, newsb);
+	}
 
 	mutex_lock(&newsbsec->lock);
 
@@ -1043,15 +1051,24 @@ static int selinux_add_mnt_opt(const char *option, const char *val, int len,
 	if (token == Opt_error)
 		return -EINVAL;
 
-	if (token != Opt_seclabel)
+	if (token != Opt_seclabel) {
 		val = kmemdup_nul(val, len, GFP_KERNEL);
+		if (!val) {
+			rc = -ENOMEM;
+			goto free_opt;
+		}
+	}
 	rc = selinux_add_opt(token, val, mnt_opts);
 	if (unlikely(rc)) {
 		kfree(val);
-		if (*mnt_opts) {
-			selinux_free_mnt_opts(*mnt_opts);
-			*mnt_opts = NULL;
-		}
+		goto free_opt;
+	}
+	return rc;
+
+free_opt:
+	if (*mnt_opts) {
+		selinux_free_mnt_opts(*mnt_opts);
+		*mnt_opts = NULL;
 	}
 	return rc;
 }
@@ -1067,6 +1084,7 @@ static int show_sid(struct seq_file *m, u32 sid)
 	if (!rc) {
 		bool has_comma = context && strchr(context, ',');
 
+		seq_putc(m, '=');
 		if (has_comma)
 			seq_putc(m, '\"');
 		seq_escape(m, context, "\"\n\\");
@@ -1120,7 +1138,7 @@ static int selinux_sb_show_options(struct seq_file *m, struct super_block *sb)
 	}
 	if (sbsec->flags & SBLABEL_MNT) {
 		seq_putc(m, ',');
-		seq_puts(m, LABELSUPP_STR);
+		seq_puts(m, SECLABEL_STR);
 	}
 	return 0;
 }
@@ -1348,6 +1366,67 @@ static int selinux_genfs_get_sid(struct dentry *dentry,
 	return rc;
 }
 
+static int inode_doinit_use_xattr(struct inode *inode, struct dentry *dentry,
+				  u32 def_sid, u32 *sid)
+{
+#define INITCONTEXTLEN 255
+	char *context;
+	unsigned int len;
+	int rc;
+
+	len = INITCONTEXTLEN;
+	context = kmalloc(len + 1, GFP_NOFS);
+	if (!context)
+		return -ENOMEM;
+
+	context[len] = '\0';
+	rc = __vfs_getxattr(dentry, inode, XATTR_NAME_SELINUX, context, len);
+	if (rc == -ERANGE) {
+		kfree(context);
+
+		/* Need a larger buffer.  Query for the right size. */
+		rc = __vfs_getxattr(dentry, inode, XATTR_NAME_SELINUX, NULL, 0);
+		if (rc < 0)
+			return rc;
+
+		len = rc;
+		context = kmalloc(len + 1, GFP_NOFS);
+		if (!context)
+			return -ENOMEM;
+
+		context[len] = '\0';
+		rc = __vfs_getxattr(dentry, inode, XATTR_NAME_SELINUX,
+				    context, len);
+	}
+	if (rc < 0) {
+		kfree(context);
+		if (rc != -ENODATA) {
+			pr_warn("SELinux: %s:  getxattr returned %d for dev=%s ino=%ld\n",
+				__func__, -rc, inode->i_sb->s_id, inode->i_ino);
+			return rc;
+		}
+		*sid = def_sid;
+		return 0;
+	}
+
+	rc = security_context_to_sid_default(&selinux_state, context, rc, sid,
+					     def_sid, GFP_NOFS);
+	if (rc) {
+		char *dev = inode->i_sb->s_id;
+		unsigned long ino = inode->i_ino;
+
+		if (rc == -EINVAL) {
+			pr_notice_ratelimited("SELinux: inode=%lu on dev=%s was found to have an invalid context=%s.  This indicates you may need to relabel the inode or the filesystem in question.\n",
+					      ino, dev, context);
+		} else {
+			pr_warn("SELinux: %s:  context_to_sid(%s) returned %d for dev=%s ino=%ld\n",
+				__func__, context, -rc, dev, ino);
+		}
+	}
+	kfree(context);
+	return 0;
+}
+
 /* The inode's security attributes must be initialized before first use. */
 static int inode_doinit_with_dentry(struct inode *inode, struct dentry *opt_dentry)
 {
@@ -1356,9 +1435,6 @@ static int inode_doinit_with_dentry(struct inode *inode, struct dentry *opt_dent
 	u32 task_sid, sid = 0;
 	u16 sclass;
 	struct dentry *dentry;
-#define INITCONTEXTLEN 255
-	char *context = NULL;
-	unsigned len = 0;
 	int rc = 0;
 
 	if (isec->initialized == LABEL_INITIALIZED)
@@ -1426,72 +1502,11 @@ static int inode_doinit_with_dentry(struct inode *inode, struct dentry *opt_dent
 			goto out;
 		}
 
-		len = INITCONTEXTLEN;
-		context = kmalloc(len+1, GFP_NOFS);
-		if (!context) {
-			rc = -ENOMEM;
-			dput(dentry);
-			goto out;
-		}
-		context[len] = '\0';
-		rc = __vfs_getxattr(dentry, inode, XATTR_NAME_SELINUX, context, len);
-		if (rc == -ERANGE) {
-			kfree(context);
-
-			/* Need a larger buffer.  Query for the right size. */
-			rc = __vfs_getxattr(dentry, inode, XATTR_NAME_SELINUX, NULL, 0);
-			if (rc < 0) {
-				dput(dentry);
-				goto out;
-			}
-			len = rc;
-			context = kmalloc(len+1, GFP_NOFS);
-			if (!context) {
-				rc = -ENOMEM;
-				dput(dentry);
-				goto out;
-			}
-			context[len] = '\0';
-			rc = __vfs_getxattr(dentry, inode, XATTR_NAME_SELINUX, context, len);
-		}
+		rc = inode_doinit_use_xattr(inode, dentry, sbsec->def_sid,
+					    &sid);
 		dput(dentry);
-		if (rc < 0) {
-			if (rc != -ENODATA) {
-				pr_warn("SELinux: %s:  getxattr returned "
-				       "%d for dev=%s ino=%ld\n", __func__,
-				       -rc, inode->i_sb->s_id, inode->i_ino);
-				kfree(context);
-				goto out;
-			}
-			/* Map ENODATA to the default file SID */
-			sid = sbsec->def_sid;
-			rc = 0;
-		} else {
-			rc = security_context_to_sid_default(&selinux_state,
-							     context, rc, &sid,
-							     sbsec->def_sid,
-							     GFP_NOFS);
-			if (rc) {
-				char *dev = inode->i_sb->s_id;
-				unsigned long ino = inode->i_ino;
-
-				if (rc == -EINVAL) {
-					if (printk_ratelimit())
-						pr_notice("SELinux: inode=%lu on dev=%s was found to have an invalid "
-							"context=%s.  This indicates you may need to relabel the inode or the "
-							"filesystem in question.\n", ino, dev, context);
-				} else {
-					pr_warn("SELinux: %s:  context_to_sid(%s) "
-					       "returned %d for dev=%s ino=%ld\n",
-					       __func__, context, -rc, dev, ino);
-				}
-				kfree(context);
-				/* Leave with the unlabeled SID */
-				rc = 0;
-				break;
-			}
-		}
-		kfree(context);
+		if (rc)
+			goto out;
 		break;
 	case SECURITY_FS_USE_TASK:
 		sid = task_sid;
@@ -1542,9 +1557,21 @@ static int inode_doinit_with_dentry(struct inode *inode, struct dentry *opt_dent
 				goto out;
 			rc = selinux_genfs_get_sid(dentry, sclass,
 						   sbsec->flags, &sid);
-			dput(dentry);
-			if (rc)
+			if (rc) {
+				dput(dentry);
 				goto out;
+			}
+
+			if ((sbsec->flags & SE_SBGENFS_XATTR) &&
+			    (inode->i_opflags & IOP_XATTR)) {
+				rc = inode_doinit_use_xattr(inode, dentry,
+							    sid, &sid);
+				if (rc) {
+					dput(dentry);
+					goto out;
+				}
+			}
+			dput(dentry);
 		}
 		break;
 	}
@@ -2597,10 +2624,11 @@ static int selinux_sb_eat_lsm_opts(char *options, void **mnt_opts)
 	char *from = options;
 	char *to = options;
 	bool first = true;
+	int rc;
 
 	while (1) {
 		int len = opt_len(from);
-		int token, rc;
+		int token;
 		char *arg = NULL;
 
 		token = match_opt_prefix(from, len, &arg);
@@ -2616,15 +2644,15 @@ static int selinux_sb_eat_lsm_opts(char *options, void **mnt_opts)
 						*q++ = c;
 				}
 				arg = kmemdup_nul(arg, q - arg, GFP_KERNEL);
+				if (!arg) {
+					rc = -ENOMEM;
+					goto free_opt;
+				}
 			}
 			rc = selinux_add_opt(token, arg, mnt_opts);
 			if (unlikely(rc)) {
 				kfree(arg);
-				if (*mnt_opts) {
-					selinux_free_mnt_opts(*mnt_opts);
-					*mnt_opts = NULL;
-				}
-				return rc;
+				goto free_opt;
 			}
 		} else {
 			if (!first) {	// copy with preceding comma
@@ -2642,6 +2670,13 @@ static int selinux_sb_eat_lsm_opts(char *options, void **mnt_opts)
 	}
 	*to = '\0';
 	return 0;
+
+free_opt:
+	if (*mnt_opts) {
+		selinux_free_mnt_opts(*mnt_opts);
+		*mnt_opts = NULL;
+	}
+	return rc;
 }
 
 static int selinux_sb_remount(struct super_block *sb, void *mnt_opts)
@@ -2737,6 +2772,76 @@ static int selinux_umount(struct vfsmount *mnt, int flags)
 
 	return superblock_has_perm(cred, mnt->mnt_sb,
 				   FILESYSTEM__UNMOUNT, NULL);
+}
+
+static int selinux_fs_context_dup(struct fs_context *fc,
+				  struct fs_context *src_fc)
+{
+	const struct selinux_mnt_opts *src = src_fc->security;
+	struct selinux_mnt_opts *opts;
+
+	if (!src)
+		return 0;
+
+	fc->security = kzalloc(sizeof(struct selinux_mnt_opts), GFP_KERNEL);
+	if (!fc->security)
+		return -ENOMEM;
+
+	opts = fc->security;
+
+	if (src->fscontext) {
+		opts->fscontext = kstrdup(src->fscontext, GFP_KERNEL);
+		if (!opts->fscontext)
+			return -ENOMEM;
+	}
+	if (src->context) {
+		opts->context = kstrdup(src->context, GFP_KERNEL);
+		if (!opts->context)
+			return -ENOMEM;
+	}
+	if (src->rootcontext) {
+		opts->rootcontext = kstrdup(src->rootcontext, GFP_KERNEL);
+		if (!opts->rootcontext)
+			return -ENOMEM;
+	}
+	if (src->defcontext) {
+		opts->defcontext = kstrdup(src->defcontext, GFP_KERNEL);
+		if (!opts->defcontext)
+			return -ENOMEM;
+	}
+	return 0;
+}
+
+static const struct fs_parameter_spec selinux_param_specs[] = {
+	fsparam_string(CONTEXT_STR,	Opt_context),
+	fsparam_string(DEFCONTEXT_STR,	Opt_defcontext),
+	fsparam_string(FSCONTEXT_STR,	Opt_fscontext),
+	fsparam_string(ROOTCONTEXT_STR,	Opt_rootcontext),
+	fsparam_flag  (SECLABEL_STR,	Opt_seclabel),
+	{}
+};
+
+static const struct fs_parameter_description selinux_fs_parameters = {
+	.name		= "SELinux",
+	.specs		= selinux_param_specs,
+};
+
+static int selinux_fs_context_parse_param(struct fs_context *fc,
+					  struct fs_parameter *param)
+{
+	struct fs_parse_result result;
+	int opt, rc;
+
+	opt = fs_parse(fc, &selinux_fs_parameters, param, &result);
+	if (opt < 0)
+		return opt;
+
+	rc = selinux_add_opt(opt, param->string, &fc->security);
+	if (!rc) {
+		param->string = NULL;
+		rc = 1;
+	}
+	return rc;
 }
 
 /* inode security operations */
@@ -3172,6 +3277,50 @@ static int selinux_inode_removexattr(struct dentry *dentry, const char *name)
 	return -EACCES;
 }
 
+static int selinux_path_notify(const struct path *path, u64 mask,
+						unsigned int obj_type)
+{
+	int ret;
+	u32 perm;
+
+	struct common_audit_data ad;
+
+	ad.type = LSM_AUDIT_DATA_PATH;
+	ad.u.path = *path;
+
+	/*
+	 * Set permission needed based on the type of mark being set.
+	 * Performs an additional check for sb watches.
+	 */
+	switch (obj_type) {
+	case FSNOTIFY_OBJ_TYPE_VFSMOUNT:
+		perm = FILE__WATCH_MOUNT;
+		break;
+	case FSNOTIFY_OBJ_TYPE_SB:
+		perm = FILE__WATCH_SB;
+		ret = superblock_has_perm(current_cred(), path->dentry->d_sb,
+						FILESYSTEM__WATCH, &ad);
+		if (ret)
+			return ret;
+		break;
+	case FSNOTIFY_OBJ_TYPE_INODE:
+		perm = FILE__WATCH;
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	/* blocking watches require the file:watch_with_perm permission */
+	if (mask & (ALL_FSNOTIFY_PERM_EVENTS))
+		perm |= FILE__WATCH_WITH_PERM;
+
+	/* watches on read-like events need the file:watch_reads permission */
+	if (mask & (FS_ACCESS | FS_ACCESS_PERM | FS_CLOSE_NOWRITE))
+		perm |= FILE__WATCH_READS;
+
+	return path_has_perm(current_cred(), path, perm);
+}
+
 /*
  * Copy the inode security context value to the user.
  *
@@ -3294,6 +3443,67 @@ static int selinux_inode_copy_up_xattr(const char *name)
 	 */
 	return -EOPNOTSUPP;
 }
+
+/* kernfs node operations */
+
+static int selinux_kernfs_init_security(struct kernfs_node *kn_dir,
+					struct kernfs_node *kn)
+{
+	const struct task_security_struct *tsec = selinux_cred(current_cred());
+	u32 parent_sid, newsid, clen;
+	int rc;
+	char *context;
+
+	rc = kernfs_xattr_get(kn_dir, XATTR_NAME_SELINUX, NULL, 0);
+	if (rc == -ENODATA)
+		return 0;
+	else if (rc < 0)
+		return rc;
+
+	clen = (u32)rc;
+	context = kmalloc(clen, GFP_KERNEL);
+	if (!context)
+		return -ENOMEM;
+
+	rc = kernfs_xattr_get(kn_dir, XATTR_NAME_SELINUX, context, clen);
+	if (rc < 0) {
+		kfree(context);
+		return rc;
+	}
+
+	rc = security_context_to_sid(&selinux_state, context, clen, &parent_sid,
+				     GFP_KERNEL);
+	kfree(context);
+	if (rc)
+		return rc;
+
+	if (tsec->create_sid) {
+		newsid = tsec->create_sid;
+	} else {
+		u16 secclass = inode_mode_to_security_class(kn->mode);
+		struct qstr q;
+
+		q.name = kn->name;
+		q.hash_len = hashlen_string(kn_dir, kn->name);
+
+		rc = security_transition_sid(&selinux_state, tsec->sid,
+					     parent_sid, secclass, &q,
+					     &newsid);
+		if (rc)
+			return rc;
+	}
+
+	rc = security_sid_to_context_force(&selinux_state, newsid,
+					   &context, &clen);
+	if (rc)
+		return rc;
+
+	rc = kernfs_xattr_set(kn, XATTR_NAME_SELINUX, context, clen,
+			      XATTR_CREATE);
+	kfree(context);
+	return rc;
+}
+
 
 /* file security operations */
 
@@ -4362,7 +4572,7 @@ static int selinux_socket_bind(struct socket *sock, struct sockaddr *address, in
 		struct lsm_network_audit net = {0,};
 		struct sockaddr_in *addr4 = NULL;
 		struct sockaddr_in6 *addr6 = NULL;
-		u16 family_sa = address->sa_family;
+		u16 family_sa;
 		unsigned short snum;
 		u32 sid, node_perm;
 
@@ -4372,6 +4582,9 @@ static int selinux_socket_bind(struct socket *sock, struct sockaddr *address, in
 		 * need to check address->sa_family as it is possible to have
 		 * sk->sk_family = PF_INET6 with addr->sa_family = AF_INET.
 		 */
+		if (addrlen < offsetofend(struct sockaddr, sa_family))
+			return -EINVAL;
+		family_sa = address->sa_family;
 		switch (family_sa) {
 		case AF_UNSPEC:
 		case AF_INET:
@@ -4472,7 +4685,7 @@ err_af:
 }
 
 /* This supports connect(2) and SCTP connect services such as sctp_connectx(3)
- * and sctp_sendmsg(3) as described in Documentation/security/LSM-sctp.rst
+ * and sctp_sendmsg(3) as described in Documentation/security/SCTP.rst
  */
 static int selinux_socket_connect_helper(struct socket *sock,
 					 struct sockaddr *address, int addrlen)
@@ -4484,6 +4697,14 @@ static int selinux_socket_connect_helper(struct socket *sock,
 	err = sock_has_perm(sk, SOCKET__CONNECT);
 	if (err)
 		return err;
+	if (addrlen < offsetofend(struct sockaddr, sa_family))
+		return -EINVAL;
+
+	/* connect(AF_UNSPEC) has special handling, as it is a documented
+	 * way to disconnect the socket
+	 */
+	if (address->sa_family == AF_UNSPEC)
+		return 0;
 
 	/*
 	 * If a TCP, DCCP or SCTP socket, check name_connect permission
@@ -5060,6 +5281,9 @@ static int selinux_sctp_bind_connect(struct sock *sk, int optname,
 		default:
 			return -EINVAL;
 		}
+
+		if (walk_size + len > addrlen)
+			return -EINVAL;
 
 		err = -EINVAL;
 		switch (optname) {
@@ -6173,11 +6397,12 @@ static int selinux_setprocattr(const char *name, void *value, size_t size)
 	} else if (!strcmp(name, "fscreate")) {
 		tsec->create_sid = sid;
 	} else if (!strcmp(name, "keycreate")) {
-		error = avc_has_perm(&selinux_state,
-				     mysid, sid, SECCLASS_KEY, KEY__CREATE,
-				     NULL);
-		if (error)
-			goto abort_change;
+		if (sid) {
+			error = avc_has_perm(&selinux_state, mysid, sid,
+					     SECCLASS_KEY, KEY__CREATE, NULL);
+			if (error)
+				goto abort_change;
+		}
 		tsec->keycreate_sid = sid;
 	} else if (!strcmp(name, "sockcreate")) {
 		tsec->sockcreate_sid = sid;
@@ -6592,6 +6817,9 @@ static struct security_hook_list selinux_hooks[] __lsm_ro_after_init = {
 	LSM_HOOK_INIT(bprm_committing_creds, selinux_bprm_committing_creds),
 	LSM_HOOK_INIT(bprm_committed_creds, selinux_bprm_committed_creds),
 
+	LSM_HOOK_INIT(fs_context_dup, selinux_fs_context_dup),
+	LSM_HOOK_INIT(fs_context_parse_param, selinux_fs_context_parse_param),
+
 	LSM_HOOK_INIT(sb_alloc_security, selinux_sb_alloc_security),
 	LSM_HOOK_INIT(sb_free_security, selinux_sb_free_security),
 	LSM_HOOK_INIT(sb_eat_lsm_opts, selinux_sb_eat_lsm_opts),
@@ -6636,6 +6864,9 @@ static struct security_hook_list selinux_hooks[] __lsm_ro_after_init = {
 	LSM_HOOK_INIT(inode_getsecid, selinux_inode_getsecid),
 	LSM_HOOK_INIT(inode_copy_up, selinux_inode_copy_up),
 	LSM_HOOK_INIT(inode_copy_up_xattr, selinux_inode_copy_up_xattr),
+	LSM_HOOK_INIT(path_notify, selinux_path_notify),
+
+	LSM_HOOK_INIT(kernfs_init_security, selinux_kernfs_init_security),
 
 	LSM_HOOK_INIT(file_permission, selinux_file_permission),
 	LSM_HOOK_INIT(file_alloc_security, selinux_file_alloc_security),
@@ -6836,6 +7067,8 @@ static __init int selinux_init(void)
 		pr_debug("SELinux:  Starting in enforcing mode\n");
 	else
 		pr_debug("SELinux:  Starting in permissive mode\n");
+
+	fs_validate_description(&selinux_fs_parameters);
 
 	return 0;
 }

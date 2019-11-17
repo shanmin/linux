@@ -186,18 +186,6 @@ void __init setup_memory(void)
 	paging_init();
 }
 
-#ifdef CONFIG_BLK_DEV_INITRD
-void free_initrd_mem(unsigned long start, unsigned long end)
-{
-	free_reserved_area((void *)start, (void *)end, -1, "initrd");
-}
-#endif
-
-void free_initmem(void)
-{
-	free_initmem_default(-1);
-}
-
 void __init mem_init(void)
 {
 	high_memory = (void *)__va(memory_start + lowmem_size - 1);
@@ -374,12 +362,14 @@ void * __ref zalloc_maybe_bootmem(size_t size, gfp_t mask)
 {
 	void *p;
 
-	if (mem_init_done)
+	if (mem_init_done) {
 		p = kzalloc(size, mask);
-	else {
+	} else {
 		p = memblock_alloc(size, SMP_CACHE_BYTES);
-		if (p)
-			memset(p, 0, size);
+		if (!p)
+			panic("%s: Failed to allocate %zu bytes\n",
+			      __func__, size);
 	}
+
 	return p;
 }

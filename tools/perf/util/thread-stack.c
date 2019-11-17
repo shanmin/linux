@@ -1,27 +1,20 @@
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * thread-stack.c: Synthesize a thread's stack using call / return events
  * Copyright (c) 2014, Intel Corporation.
- *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms and conditions of the GNU General Public License,
- * version 2, as published by the Free Software Foundation.
- *
- * This program is distributed in the hope it will be useful, but WITHOUT
- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
- * more details.
- *
  */
 
 #include <linux/rbtree.h>
 #include <linux/list.h>
 #include <linux/log2.h>
+#include <linux/zalloc.h>
 #include <errno.h>
+#include <stdlib.h>
+#include <string.h>
 #include "thread.h"
 #include "event.h"
 #include "machine.h"
 #include "env.h"
-#include "util.h"
 #include "debug.h"
 #include "symbol.h"
 #include "comm.h"
@@ -49,6 +42,9 @@ enum retpoline_state_t {
  * @timestamp: timestamp (if known)
  * @ref: external reference (e.g. db_id of sample)
  * @branch_count: the branch count when the entry was created
+ * @insn_count: the instruction count when the entry was created
+ * @cyc_count the cycle count when the entry was created
+ * @db_id: id used for db-export
  * @cp: call path
  * @no_call: a 'call' was not seen
  * @trace_end: a 'call' but trace ended
@@ -59,6 +55,9 @@ struct thread_stack_entry {
 	u64 timestamp;
 	u64 ref;
 	u64 branch_count;
+	u64 insn_count;
+	u64 cyc_count;
+	u64 db_id;
 	struct call_path *cp;
 	bool no_call;
 	bool trace_end;
@@ -73,6 +72,8 @@ struct thread_stack_entry {
  * @sz: current maximum stack size
  * @trace_nr: current trace number
  * @branch_count: running branch count
+ * @insn_count: running  instruction count
+ * @cyc_count running  cycle count
  * @kernel_start: kernel start address
  * @last_time: last timestamp
  * @crp: call/return processor
@@ -86,6 +87,8 @@ struct thread_stack {
 	size_t sz;
 	u64 trace_nr;
 	u64 branch_count;
+	u64 insn_count;
+	u64 cyc_count;
 	u64 kernel_start;
 	u64 last_time;
 	struct call_return_processor *crp;
@@ -280,12 +283,16 @@ static int thread_stack__call_return(struct thread *thread,
 		.comm = ts->comm,
 		.db_id = 0,
 	};
+	u64 *parent_db_id;
 
 	tse = &ts->stack[idx];
 	cr.cp = tse->cp;
 	cr.call_time = tse->timestamp;
 	cr.return_time = timestamp;
 	cr.branch_count = ts->branch_count - tse->branch_count;
+	cr.insn_count = ts->insn_count - tse->insn_count;
+	cr.cyc_count = ts->cyc_count - tse->cyc_count;
+	cr.db_id = tse->db_id;
 	cr.call_ref = tse->ref;
 	cr.return_ref = ref;
 	if (tse->no_call)
@@ -295,7 +302,14 @@ static int thread_stack__call_return(struct thread *thread,
 	if (tse->non_call)
 		cr.flags |= CALL_RETURN_NON_CALL;
 
-	return crp->process(&cr, crp->data);
+	/*
+	 * The parent db_id must be assigned before exporting the child. Note
+	 * it is not possible to export the parent first because its information
+	 * is not yet complete because its 'return' has not yet been processed.
+	 */
+	parent_db_id = idx ? &(tse - 1)->db_id : NULL;
+
+	return crp->process(&cr, parent_db_id, crp->data);
 }
 
 static int __thread_stack__flush(struct thread *thread, struct thread_stack *ts)
@@ -484,7 +498,7 @@ void thread_stack__sample(struct thread *thread, int cpu,
 }
 
 struct call_return_processor *
-call_return_processor__new(int (*process)(struct call_return *cr, void *data),
+call_return_processor__new(int (*process)(struct call_return *cr, u64 *parent_db_id, void *data),
 			   void *data)
 {
 	struct call_return_processor *crp;
@@ -533,10 +547,13 @@ static int thread_stack__push_cp(struct thread_stack *ts, u64 ret_addr,
 	tse->timestamp = timestamp;
 	tse->ref = ref;
 	tse->branch_count = ts->branch_count;
+	tse->insn_count = ts->insn_count;
+	tse->cyc_count = ts->cyc_count;
 	tse->cp = cp;
 	tse->no_call = no_call;
 	tse->trace_end = trace_end;
 	tse->non_call = false;
+	tse->db_id = 0;
 
 	return 0;
 }
@@ -613,6 +630,23 @@ static int thread_stack__bottom(struct thread_stack *ts,
 				     true, false);
 }
 
+static int thread_stack__pop_ks(struct thread *thread, struct thread_stack *ts,
+				struct perf_sample *sample, u64 ref)
+{
+	u64 tm = sample->time;
+	int err;
+
+	/* Return to userspace, so pop all kernel addresses */
+	while (thread_stack__in_kernel(ts)) {
+		err = thread_stack__call_return(thread, ts, --ts->cnt,
+						tm, ref, true);
+		if (err)
+			return err;
+	}
+
+	return 0;
+}
+
 static int thread_stack__no_call_return(struct thread *thread,
 					struct thread_stack *ts,
 					struct perf_sample *sample,
@@ -632,12 +666,9 @@ static int thread_stack__no_call_return(struct thread *thread,
 
 	if (ip >= ks && addr < ks) {
 		/* Return to userspace, so pop all kernel addresses */
-		while (thread_stack__in_kernel(ts)) {
-			err = thread_stack__call_return(thread, ts, --ts->cnt,
-							tm, ref, true);
-			if (err)
-				return err;
-		}
+		err = thread_stack__pop_ks(thread, ts, sample, ref);
+		if (err)
+			return err;
 
 		/* If the stack is empty, push the userspace address */
 		if (!ts->cnt) {
@@ -647,12 +678,9 @@ static int thread_stack__no_call_return(struct thread *thread,
 		}
 	} else if (thread_stack__in_kernel(ts) && ip < ks) {
 		/* Return to userspace, so pop all kernel addresses */
-		while (thread_stack__in_kernel(ts)) {
-			err = thread_stack__call_return(thread, ts, --ts->cnt,
-							tm, ref, true);
-			if (err)
-				return err;
-		}
+		err = thread_stack__pop_ks(thread, ts, sample, ref);
+		if (err)
+			return err;
 	}
 
 	if (ts->cnt)
@@ -862,6 +890,8 @@ int thread_stack__process(struct thread *thread, struct comm *comm,
 	}
 
 	ts->branch_count += 1;
+	ts->insn_count += sample->insn_cnt;
+	ts->cyc_count += sample->cyc_cnt;
 	ts->last_time = sample->time;
 
 	if (sample->flags & PERF_IP_FLAG_CALL) {
@@ -893,7 +923,18 @@ int thread_stack__process(struct thread *thread, struct comm *comm,
 			ts->rstate = X86_RETPOLINE_DETECTED;
 
 	} else if (sample->flags & PERF_IP_FLAG_RETURN) {
-		if (!sample->ip || !sample->addr)
+		if (!sample->addr) {
+			u32 return_from_kernel = PERF_IP_FLAG_SYSCALLRET |
+						 PERF_IP_FLAG_INTERRUPT;
+
+			if (!(sample->flags & return_from_kernel))
+				return 0;
+
+			/* Pop kernel stack */
+			return thread_stack__pop_ks(thread, ts, sample, ref);
+		}
+
+		if (!sample->ip)
 			return 0;
 
 		/* x86 retpoline 'return' doesn't match the stack */

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * clk-dfll.c - Tegra DFLL clock source common code
  *
@@ -5,15 +6,6 @@
  *
  * Aleksandr Frid <afrid@nvidia.com>
  * Paul Walmsley <pwalmsley@nvidia.com>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful, but WITHOUT
- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
- * FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
- * more details.
  *
  * This library is for the DVCO and DFLL IP blocks on the Tegra124
  * SoC. These IP blocks together are also known at NVIDIA as
@@ -34,7 +26,6 @@
  * CPU cycle time will vary. This has implications for
  * performance-measurement code and any code that relies on the CPU
  * cycle time to delay for a certain length of time.
- *
  */
 
 #include <linux/clk.h>
@@ -1293,8 +1284,8 @@ static int attr_enable_set(void *data, u64 val)
 
 	return val ? dfll_enable(td) : dfll_disable(td);
 }
-DEFINE_SIMPLE_ATTRIBUTE(enable_fops, attr_enable_get, attr_enable_set,
-			"%llu\n");
+DEFINE_DEBUGFS_ATTRIBUTE(enable_fops, attr_enable_get, attr_enable_set,
+			 "%llu\n");
 
 static int attr_lock_get(void *data, u64 *val)
 {
@@ -1310,8 +1301,7 @@ static int attr_lock_set(void *data, u64 val)
 
 	return val ? dfll_lock(td) :  dfll_unlock(td);
 }
-DEFINE_SIMPLE_ATTRIBUTE(lock_fops, attr_lock_get, attr_lock_set,
-			"%llu\n");
+DEFINE_DEBUGFS_ATTRIBUTE(lock_fops, attr_lock_get, attr_lock_set, "%llu\n");
 
 static int attr_rate_get(void *data, u64 *val)
 {
@@ -1328,7 +1318,7 @@ static int attr_rate_set(void *data, u64 val)
 
 	return dfll_request_rate(td, val);
 }
-DEFINE_SIMPLE_ATTRIBUTE(rate_fops, attr_rate_get, attr_rate_set, "%llu\n");
+DEFINE_DEBUGFS_ATTRIBUTE(rate_fops, attr_rate_get, attr_rate_set, "%llu\n");
 
 static int attr_registers_show(struct seq_file *s, void *data)
 {
@@ -1379,10 +1369,11 @@ static void dfll_debug_init(struct tegra_dfll *td)
 	root = debugfs_create_dir("tegra_dfll_fcpu", NULL);
 	td->debugfs_dir = root;
 
-	debugfs_create_file("enable", S_IRUGO | S_IWUSR, root, td, &enable_fops);
-	debugfs_create_file("lock", S_IRUGO, root, td, &lock_fops);
-	debugfs_create_file("rate", S_IRUGO, root, td, &rate_fops);
-	debugfs_create_file("registers", S_IRUGO, root, td, &attr_registers_fops);
+	debugfs_create_file_unsafe("enable", 0644, root, td,
+				   &enable_fops);
+	debugfs_create_file_unsafe("lock", 0444, root, td, &lock_fops);
+	debugfs_create_file_unsafe("rate", 0444, root, td, &rate_fops);
+	debugfs_create_file("registers", 0444, root, td, &attr_registers_fops);
 }
 
 #else

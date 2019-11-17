@@ -1,13 +1,9 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * Copyright (C) 2007 Casey Schaufler <casey@schaufler-ca.com>
  *
- *      This program is free software; you can redistribute it and/or modify
- *      it under the terms of the GNU General Public License as published by
- *      the Free Software Foundation, version 2.
- *
  * Author:
  *      Casey Schaufler <casey@schaufler-ca.com>
- *
  */
 
 #ifndef _SECURITY_SMACK_H
@@ -196,21 +192,12 @@ struct smack_known_list_elem {
 
 enum {
 	Opt_error = -1,
-	Opt_fsdefault = 1,
-	Opt_fsfloor = 2,
-	Opt_fshat = 3,
-	Opt_fsroot = 4,
-	Opt_fstransmute = 5,
+	Opt_fsdefault = 0,
+	Opt_fsfloor = 1,
+	Opt_fshat = 2,
+	Opt_fsroot = 3,
+	Opt_fstransmute = 4,
 };
-
-/*
- * Mount options
- */
-#define SMK_FSDEFAULT	"smackfsdef="
-#define SMK_FSFLOOR	"smackfsfloor="
-#define SMK_FSHAT	"smackfshat="
-#define SMK_FSROOT	"smackfsroot="
-#define SMK_FSTRANS	"smackfstransmute="
 
 #define SMACK_DELETE_OPTION	"-DELETE"
 #define SMACK_CIPSO_OPTION 	"-CIPSO"
@@ -357,6 +344,7 @@ extern struct list_head smack_onlycap_list;
 
 #define SMACK_HASH_SLOTS 16
 extern struct hlist_head smack_known_hash[SMACK_HASH_SLOTS];
+extern struct kmem_cache *smack_rule_cache;
 
 static inline struct task_smack *smack_cred(const struct cred *cred)
 {

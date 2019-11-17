@@ -1,12 +1,10 @@
+// SPDX-License-Identifier: GPL-2.0
 /*
  * drivers/base/power/runtime.c - Helper functions for device runtime PM
  *
  * Copyright (c) 2009 Rafael J. Wysocki <rjw@sisk.pl>, Novell Inc.
  * Copyright (C) 2010 Alan Stern <stern@rowland.harvard.edu>
- *
- * This file is released under the GPLv2.
  */
-
 #include <linux/sched/mm.h>
 #include <linux/ktime.h>
 #include <linux/hrtimer.h>
@@ -64,7 +62,7 @@ static int rpm_suspend(struct device *dev, int rpmflags);
  * runtime_status field is updated, to account the time in the old state
  * correctly.
  */
-void update_pm_runtime_accounting(struct device *dev)
+static void update_pm_runtime_accounting(struct device *dev)
 {
 	u64 now, last, delta;
 
@@ -98,7 +96,7 @@ static void __update_runtime_status(struct device *dev, enum rpm_status status)
 	dev->power.runtime_status = status;
 }
 
-u64 pm_runtime_suspended_time(struct device *dev)
+static u64 rpm_get_accounted_time(struct device *dev, bool suspended)
 {
 	u64 time;
 	unsigned long flags;
@@ -106,11 +104,21 @@ u64 pm_runtime_suspended_time(struct device *dev)
 	spin_lock_irqsave(&dev->power.lock, flags);
 
 	update_pm_runtime_accounting(dev);
-	time = dev->power.suspended_time;
+	time = suspended ? dev->power.suspended_time : dev->power.active_time;
 
 	spin_unlock_irqrestore(&dev->power.lock, flags);
 
 	return time;
+}
+
+u64 pm_runtime_active_time(struct device *dev)
+{
+	return rpm_get_accounted_time(dev, false);
+}
+
+u64 pm_runtime_suspended_time(struct device *dev)
+{
+	return rpm_get_accounted_time(dev, true);
 }
 EXPORT_SYMBOL_GPL(pm_runtime_suspended_time);
 
@@ -267,7 +275,7 @@ static int rpm_check_suspend_allowed(struct device *dev)
 	    || (dev->power.request_pending
 			&& dev->power.request == RPM_REQ_RESUME))
 		retval = -EAGAIN;
-	else if (__dev_pm_qos_read_value(dev) == 0)
+	else if (__dev_pm_qos_resume_latency(dev) == 0)
 		retval = -EPERM;
 	else if (dev->power.runtime_status == RPM_SUSPENDED)
 		retval = 1;
@@ -279,7 +287,8 @@ static int rpm_get_suppliers(struct device *dev)
 {
 	struct device_link *link;
 
-	list_for_each_entry_rcu(link, &dev->links.suppliers, c_node) {
+	list_for_each_entry_rcu(link, &dev->links.suppliers, c_node,
+				device_links_read_lock_held()) {
 		int retval;
 
 		if (!(link->flags & DL_FLAG_PM_RUNTIME) ||
@@ -301,7 +310,8 @@ static void rpm_put_suppliers(struct device *dev)
 {
 	struct device_link *link;
 
-	list_for_each_entry_rcu(link, &dev->links.suppliers, c_node) {
+	list_for_each_entry_rcu(link, &dev->links.suppliers, c_node,
+				device_links_read_lock_held()) {
 		if (READ_ONCE(link->status) == DL_STATE_SUPPLIER_UNBIND)
 			continue;
 
@@ -1616,7 +1626,7 @@ void pm_runtime_remove(struct device *dev)
  * runtime PM references to the device, drop the usage counter of the device
  * (as many times as needed).
  *
- * Links with the DL_FLAG_STATELESS flag set are ignored.
+ * Links with the DL_FLAG_MANAGED flag unset are ignored.
  *
  * Since the device is guaranteed to be runtime-active at the point this is
  * called, nothing else needs to be done here.
@@ -1632,8 +1642,9 @@ void pm_runtime_clean_up_links(struct device *dev)
 
 	idx = device_links_read_lock();
 
-	list_for_each_entry_rcu(link, &dev->links.consumers, s_node) {
-		if (link->flags & DL_FLAG_STATELESS)
+	list_for_each_entry_rcu(link, &dev->links.consumers, s_node,
+				device_links_read_lock_held()) {
+		if (!(link->flags & DL_FLAG_MANAGED))
 			continue;
 
 		while (refcount_dec_not_one(&link->rpm_active))
@@ -1654,7 +1665,8 @@ void pm_runtime_get_suppliers(struct device *dev)
 
 	idx = device_links_read_lock();
 
-	list_for_each_entry_rcu(link, &dev->links.suppliers, c_node)
+	list_for_each_entry_rcu(link, &dev->links.suppliers, c_node,
+				device_links_read_lock_held())
 		if (link->flags & DL_FLAG_PM_RUNTIME) {
 			link->supplier_preactivated = true;
 			refcount_inc(&link->rpm_active);
@@ -1675,7 +1687,8 @@ void pm_runtime_put_suppliers(struct device *dev)
 
 	idx = device_links_read_lock();
 
-	list_for_each_entry_rcu(link, &dev->links.suppliers, c_node)
+	list_for_each_entry_rcu(link, &dev->links.suppliers, c_node,
+				device_links_read_lock_held())
 		if (link->supplier_preactivated) {
 			link->supplier_preactivated = false;
 			if (refcount_dec_not_one(&link->rpm_active))

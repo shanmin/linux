@@ -1,12 +1,11 @@
-/*
- * drivers/base/power/sysfs.c - sysfs entries for device PM
- */
-
+// SPDX-License-Identifier: GPL-2.0
+/* sysfs entries for device PM */
 #include <linux/device.h>
 #include <linux/string.h>
 #include <linux/export.h>
 #include <linux/pm_qos.h>
 #include <linux/pm_runtime.h>
+#include <linux/pm_wakeup.h>
 #include <linux/atomic.h>
 #include <linux/jiffies.h>
 #include "power.h"
@@ -125,13 +124,9 @@ static ssize_t runtime_active_time_show(struct device *dev,
 				struct device_attribute *attr, char *buf)
 {
 	int ret;
-	u64 tmp;
-	spin_lock_irq(&dev->power.lock);
-	update_pm_runtime_accounting(dev);
-	tmp = dev->power.active_time;
+	u64 tmp = pm_runtime_active_time(dev);
 	do_div(tmp, NSEC_PER_MSEC);
 	ret = sprintf(buf, "%llu\n", tmp);
-	spin_unlock_irq(&dev->power.lock);
 	return ret;
 }
 
@@ -141,13 +136,9 @@ static ssize_t runtime_suspended_time_show(struct device *dev,
 				struct device_attribute *attr, char *buf)
 {
 	int ret;
-	u64 tmp;
-	spin_lock_irq(&dev->power.lock);
-	update_pm_runtime_accounting(dev);
-	tmp = dev->power.suspended_time;
+	u64 tmp = pm_runtime_suspended_time(dev);
 	do_div(tmp, NSEC_PER_MSEC);
 	ret = sprintf(buf, "%llu\n", tmp);
-	spin_unlock_irq(&dev->power.lock);
 	return ret;
 }
 
@@ -677,8 +668,13 @@ int dpm_sysfs_add(struct device *dev)
 		if (rc)
 			goto err_wakeup;
 	}
+	rc = pm_wakeup_source_sysfs_add(dev);
+	if (rc)
+		goto err_latency;
 	return 0;
 
+ err_latency:
+	sysfs_unmerge_group(&dev->kobj, &pm_qos_latency_tolerance_attr_group);
  err_wakeup:
 	sysfs_unmerge_group(&dev->kobj, &pm_wakeup_attr_group);
  err_runtime:
