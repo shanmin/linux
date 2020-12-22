@@ -69,7 +69,7 @@ Construction Parameters
 
 <#opt_params>
     Number of optional parameters. If there are no optional parameters,
-    the optional paramaters section can be skipped or #opt_params can be zero.
+    the optional parameters section can be skipped or #opt_params can be zero.
     Otherwise #opt_params is the number of following arguments.
 
     Example of optional parameters section:
@@ -82,6 +82,10 @@ restart_on_corruption
     Restart the system when a corrupted block is discovered. This option is
     not compatible with ignore_corruption and requires user space support to
     avoid restart loops.
+
+panic_on_corruption
+    Panic the device when a corrupted block is discovered. This option is
+    not compatible with ignore_corruption and restart_on_corruption.
 
 ignore_zero_blocks
     Do not verify blocks that are expected to contain zeroes and always return

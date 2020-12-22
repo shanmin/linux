@@ -638,9 +638,15 @@ void irq_init_desc(unsigned int irq)
 int generic_handle_irq(unsigned int irq)
 {
 	struct irq_desc *desc = irq_to_desc(irq);
+	struct irq_data *data;
 
 	if (!desc)
 		return -EINVAL;
+
+	data = irq_desc_get_irq_data(desc);
+	if (WARN_ON_ONCE(!in_irq() && handle_enforce_irqctx(data)))
+		return -EPERM;
+
 	generic_handle_irq_desc(desc);
 	return 0;
 }
@@ -750,7 +756,7 @@ void irq_free_descs(unsigned int from, unsigned int cnt)
 EXPORT_SYMBOL_GPL(irq_free_descs);
 
 /**
- * irq_alloc_descs - allocate and initialize a range of irq descriptors
+ * __irq_alloc_descs - allocate and initialize a range of irq descriptors
  * @irq:	Allocate for specific irq number if irq >= 0
  * @from:	Start the search from this irq number
  * @cnt:	Number of consecutive irqs to allocate.
@@ -804,57 +810,6 @@ unlock:
 }
 EXPORT_SYMBOL_GPL(__irq_alloc_descs);
 
-#ifdef CONFIG_GENERIC_IRQ_LEGACY_ALLOC_HWIRQ
-/**
- * irq_alloc_hwirqs - Allocate an irq descriptor and initialize the hardware
- * @cnt:	number of interrupts to allocate
- * @node:	node on which to allocate
- *
- * Returns an interrupt number > 0 or 0, if the allocation fails.
- */
-unsigned int irq_alloc_hwirqs(int cnt, int node)
-{
-	int i, irq = __irq_alloc_descs(-1, 0, cnt, node, NULL, NULL);
-
-	if (irq < 0)
-		return 0;
-
-	for (i = irq; cnt > 0; i++, cnt--) {
-		if (arch_setup_hwirq(i, node))
-			goto err;
-		irq_clear_status_flags(i, _IRQ_NOREQUEST);
-	}
-	return irq;
-
-err:
-	for (i--; i >= irq; i--) {
-		irq_set_status_flags(i, _IRQ_NOREQUEST | _IRQ_NOPROBE);
-		arch_teardown_hwirq(i);
-	}
-	irq_free_descs(irq, cnt);
-	return 0;
-}
-EXPORT_SYMBOL_GPL(irq_alloc_hwirqs);
-
-/**
- * irq_free_hwirqs - Free irq descriptor and cleanup the hardware
- * @from:	Free from irq number
- * @cnt:	number of interrupts to free
- *
- */
-void irq_free_hwirqs(unsigned int from, int cnt)
-{
-	int i, j;
-
-	for (i = from, j = cnt; j > 0; i++, j--) {
-		irq_set_status_flags(i, _IRQ_NOREQUEST | _IRQ_NOPROBE);
-		arch_teardown_hwirq(i);
-	}
-	irq_free_descs(from, cnt);
-}
-EXPORT_SYMBOL_GPL(irq_free_hwirqs);
-#endif
-
 /**
  * irq_get_next_irq - get next allocated irq number
  * @offset:	where to start the search
@@ -891,6 +846,7 @@ __irq_get_desc_lock(unsigned int irq, unsigned long *flags, bool bus,
 }
 
 void __irq_put_desc_unlock(struct irq_desc *desc, unsigned long flags, bool bus)
+	__releases(&desc->lock)
 {
 	raw_spin_unlock_irqrestore(&desc->lock, flags);
 	if (bus)

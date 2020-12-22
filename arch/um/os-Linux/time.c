@@ -7,6 +7,7 @@
  */
 
 #include <stddef.h>
+#include <unistd.h>
 #include <errno.h>
 #include <signal.h>
 #include <time.h>
@@ -14,7 +15,6 @@
 #include <kern_util.h>
 #include <os.h>
 #include <string.h>
-#include <timer-internal.h>
 
 static timer_t event_high_res_timer = 0;
 
@@ -100,19 +100,9 @@ long long os_nsecs(void)
 }
 
 /**
- * os_idle_sleep() - sleep for a given time of nsecs
- * @nsecs: nanoseconds to sleep
+ * os_idle_sleep() - sleep until interrupted
  */
-void os_idle_sleep(unsigned long long nsecs)
+void os_idle_sleep(void)
 {
-	struct timespec ts = {
-		.tv_sec  = nsecs / UM_NSEC_PER_SEC,
-		.tv_nsec = nsecs % UM_NSEC_PER_SEC
-	};
-
-	/*
-	 * Relay the signal if clock_nanosleep is interrupted.
-	 */
-	if (clock_nanosleep(CLOCK_MONOTONIC, 0, &ts, NULL))
-		deliver_alarm();
+	pause();
 }
